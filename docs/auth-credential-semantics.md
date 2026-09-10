@@ -87,6 +87,15 @@ existing resolution and fallback behavior.
 
 `openclaw agent exec` preserves the original shared-store root when switching to temporary run state. Its bounded credential scope reads shared `api_key`, `token`, and OAuth profiles as an owner-tagged in-memory view; the configured agent's local profiles still win. The temporary store never persists inherited credentials. OAuth refresh locking and rotated-token persistence remain with the canonical shared SQLite owner, so the run does not acquire another refresh owner. `--auth-env-only` disables stored credential access entirely.
 
+Temporary exec OAuth refreshes retain one explicit durable-owner context from selection through settlement:
+
+- An agent-local OAuth profile keeps its original agent database as owner; only an inherited shared profile uses the shared database.
+- Claim, settlement, observation, and recovery reread that durable owner directly. Captured/read-through credentials are selection inputs only and cannot override a durable removal or account reassignment.
+- The owner's original state environment selects the profile lock, shared database, registered agents, and historical peers for fencing as well as persistence. The temporary state root is never a refresh-coordination root.
+- Before provider refresh I/O, the claim must still match the selected durable generation and identity. Missing or reassigned durable credentials fail closed.
+
+Regression coverage for this boundary must use distinct original and temporary state roots. It must prove expired agent-local OAuth refreshes in place, historical peer fencing under the original root, removal and reassignment before provider I/O, and a successful shared-owner refresh persisted only to the canonical shared store.
+
 Auth writes that explicitly select a state directory, including isolated QA staging, use that directory's shared store for ownership and OAuth deduplication. Their runtime publication and rollback retain the same owner; another process-local state root is not an inherited base. An unrelated outer database may be older, newer, or unreadable without blocking an isolated write, but an unreadable or newer database in the selected target still fails closed. Writes without an explicit state directory retain the normal ambient state and agent-directory configuration.
 
 ## Personal model accounts
