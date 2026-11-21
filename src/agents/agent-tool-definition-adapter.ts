@@ -406,6 +406,38 @@ async function applyToolResultTransform(params: {
   });
 }
 
+/**
+ * tool-search runs its nested target tools directly, outside toToolDefinitions,
+ * and projects their results into the transcript. Give such a result (or the
+ * error a nested call threw) the same tool_result_transform pass, failing
+ * closed, before it is projected or returned.
+ */
+export async function transformNestedToolResult(params: {
+  toolName: string;
+  toolCallId: string;
+  input: unknown;
+  result?: AgentToolResult<unknown>;
+  errorMessage?: string;
+  hookContext?: HookContext;
+}): Promise<AgentToolResult<unknown>> {
+  const result =
+    params.errorMessage !== undefined
+      ? {
+          content: [{ type: "text" as const, text: params.errorMessage }],
+          details: { status: "error", error: params.errorMessage },
+        }
+      : (params.result as AgentToolResult<unknown>);
+  return await applyToolResultTransform({
+    toolName: params.toolName,
+    normalizedName: normalizeToolName(params.toolName),
+    toolParams: params.input,
+    toolCallId: params.toolCallId,
+    result,
+    ...(params.errorMessage !== undefined ? { error: params.errorMessage } : {}),
+    ...(params.hookContext ? { hookContext: params.hookContext } : {}),
+  });
+}
+
 /** Convert executable agent tools into session definitions with hook handling. */
 export function toToolDefinitions(
   tools: AnyAgentTool[],

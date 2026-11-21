@@ -116,6 +116,7 @@ import {
   findClientToolNameConflicts,
   toClientToolDefinitions,
   toToolDefinitions,
+  transformNestedToolResult,
 } from "../../agent-tool-definition-adapter.js";
 import { recordStructuredReplayTrustForToolCall } from "../../agent-tools.before-tool-call.js";
 import {
@@ -3826,7 +3827,7 @@ export async function runEmbeddedAttempt(
               params.runId,
             );
           }
-          const result = await runToolLifecycle({
+          const rawResult = await runToolLifecycle({
             toolName: toolParams.toolName,
             toolCallId: toolParams.toolCallId,
             args: toolParams.input,
@@ -3842,6 +3843,13 @@ export async function runEmbeddedAttempt(
                 toolParams.onUpdate,
                 undefined as never,
               ),
+          });
+          const result = await transformNestedToolResult({
+            toolName: toolParams.toolName,
+            toolCallId: toolParams.toolCallId,
+            input: toolParams.input,
+            result: rawResult,
+            hookContext: catalogToolHookContext,
           });
           toolSearchTargetTranscriptProjections.push({
             parentToolCallId: toolParams.parentToolCallId,
@@ -3859,10 +3867,13 @@ export async function runEmbeddedAttempt(
             toolCallId: toolParams.toolCallId,
             toolName: toolParams.toolName,
             input: toolParams.input,
-            result: {
-              content: [{ type: "text", text: message }],
-              details: { status: "error", error: message },
-            },
+            result: await transformNestedToolResult({
+              toolName: toolParams.toolName,
+              toolCallId: toolParams.toolCallId,
+              input: toolParams.input,
+              errorMessage: message,
+              hookContext: catalogToolHookContext,
+            }),
             isError: true,
             timestamp: Date.now(),
           });

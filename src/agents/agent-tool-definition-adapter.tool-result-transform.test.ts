@@ -7,7 +7,7 @@ import { Type } from "typebox";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createHookRunner, TOOL_RESULT_WITHHELD_TEXT } from "../plugins/hooks.js";
 import { createMockPluginRegistry } from "../plugins/hooks.test-helpers.js";
-import { toToolDefinitions } from "./agent-tool-definition-adapter.js";
+import { toToolDefinitions, transformNestedToolResult } from "./agent-tool-definition-adapter.js";
 
 const state = vi.hoisted(() => ({ runner: null as unknown }));
 
@@ -144,5 +144,43 @@ describe("agent tool definition adapter tool_result_transform", () => {
     const result = await run(textTool("token FAKE-SECRET-789 here"));
     expect(JSON.stringify(result)).not.toContain("FAKE-SECRET-789");
     expect(result.details).toMatchObject({ error: TOOL_RESULT_WITHHELD_TEXT });
+  });
+
+  it("transforms nested tool-search results and errors before they are projected", async () => {
+    useHooks([{ hookName: "tool_result_transform", handler: redact }]);
+    const ok = await transformNestedToolResult({
+      toolName: "read",
+      toolCallId: "nested-1",
+      input: {},
+      result: { content: [{ type: "text", text: "FAKE-SECRET-123" }], details: {} },
+    });
+    expect(JSON.stringify(ok)).not.toContain("FAKE-SECRET-123");
+    const failed = await transformNestedToolResult({
+      toolName: "read",
+      toolCallId: "nested-2",
+      input: {},
+      errorMessage: "denied for FAKE-SECRET-123",
+    });
+    expect(JSON.stringify(failed)).not.toContain("FAKE-SECRET-123");
+    expect(failed.details).toMatchObject({ status: "error" });
+  });
+
+  it("withholds a nested tool-search result when a handler throws", async () => {
+    useHooks([
+      {
+        hookName: "tool_result_transform",
+        handler: () => {
+          throw new Error("scrubber crashed");
+        },
+      },
+    ]);
+    const out = await transformNestedToolResult({
+      toolName: "read",
+      toolCallId: "nested-3",
+      input: {},
+      result: { content: [{ type: "text", text: "FAKE-SECRET-123" }], details: {} },
+    });
+    expect(JSON.stringify(out)).not.toContain("FAKE-SECRET-123");
+    expect(out.details).toMatchObject({ error: TOOL_RESULT_WITHHELD_TEXT });
   });
 });
