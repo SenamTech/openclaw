@@ -7,6 +7,7 @@ import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
 import type { ClientToolDefinition } from "./pi-embedded-runner/run/params.js";
 import { logDebug, logError } from "../logger.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
+import { TOOL_RESULT_WITHHELD_TEXT } from "../plugins/hooks.js";
 import { isPlainObject } from "../utils.js";
 import {
   consumeAdjustedParamsForToolCall,
@@ -83,6 +84,40 @@ function splitToolExecuteArgs(args: ToolExecuteArgsAny): {
   };
 }
 
+/**
+ * Run after_tool_call with the result the agent is about to receive. Hooks may
+ * change it in place. Reports false when a hook failed, so the caller withholds
+ * the result (fail closed) instead of passing on possibly unprocessed output.
+ */
+async function runAfterToolCallHook(
+  event: { toolName: string; params: unknown; result: unknown; error?: string },
+  normalizedName: string,
+): Promise<boolean> {
+  const hookRunner = getGlobalHookRunner();
+  if (!hookRunner?.hasHooks("after_tool_call")) {
+    return true;
+  }
+  try {
+    const outcome = await hookRunner.runAfterToolCallWithOutcome(
+      {
+        toolName: event.toolName,
+        params: isPlainObject(event.params) ? event.params : {},
+        result: event.result,
+        ...(event.error !== undefined ? { error: event.error } : {}),
+      },
+      { toolName: event.toolName },
+    );
+    return !outcome.failed;
+  } catch (hookErr) {
+    logDebug(`after_tool_call hook failed: tool=${normalizedName} error=${String(hookErr)}`);
+    return false;
+  }
+}
+
+function withheldToolResult(normalizedName: string): AgentToolResult<unknown> {
+  return jsonResult({ status: "error", tool: normalizedName, error: TOOL_RESULT_WITHHELD_TEXT });
+}
+
 export function toToolDefinitions(tools: AnyAgentTool[]): ToolDefinition[] {
   return tools.map((tool) => {
     const name = tool.name || "tool";
@@ -113,25 +148,14 @@ export function toToolDefinitions(tools: AnyAgentTool[]): ToolDefinition[] {
             ? (consumeAdjustedParamsForToolCall(toolCallId) ?? executeParams)
             : executeParams;
 
-          // Call after_tool_call hook
-          const hookRunner = getGlobalHookRunner();
-          if (hookRunner?.hasHooks("after_tool_call")) {
-            try {
-              await hookRunner.runAfterToolCall(
-                {
-                  toolName: name,
-                  params: isPlainObject(afterParams) ? afterParams : {},
-                  result,
-                },
-                { toolName: name },
-              );
-            } catch (hookErr) {
-              logDebug(
-                `after_tool_call hook failed: tool=${normalizedName} error=${String(hookErr)}`,
-              );
-            }
+          if (
+            !(await runAfterToolCallHook(
+              { toolName: name, params: afterParams, result },
+              normalizedName,
+            ))
+          ) {
+            return withheldToolResult(normalizedName);
           }
-
           return result;
         } catch (err) {
           if (signal?.aborted) {
@@ -159,25 +183,16 @@ export function toToolDefinitions(tools: AnyAgentTool[]): ToolDefinition[] {
             error: described.message,
           });
 
-          // Call after_tool_call hook for errors too
-          const hookRunner = getGlobalHookRunner();
-          if (hookRunner?.hasHooks("after_tool_call")) {
-            try {
-              await hookRunner.runAfterToolCall(
-                {
-                  toolName: normalizedName,
-                  params: isPlainObject(params) ? params : {},
-                  error: described.message,
-                },
-                { toolName: normalizedName },
-              );
-            } catch (hookErr) {
-              logDebug(
-                `after_tool_call hook failed: tool=${normalizedName} error=${String(hookErr)}`,
-              );
-            }
+          // Errors go through after_tool_call too, with the error result the
+          // agent will receive, so hooks can process it like a normal result.
+          if (
+            !(await runAfterToolCallHook(
+              { toolName: normalizedName, params, result: errorResult, error: described.message },
+              normalizedName,
+            ))
+          ) {
+            return withheldToolResult(normalizedName);
           }
-
           return errorResult;
         }
       },

@@ -460,9 +460,19 @@ export type PluginHookBeforeToolCallResult = {
 export type PluginHookAfterToolCallEvent = {
   toolName: string;
   params: Record<string, unknown>;
+  /**
+   * The tool result object. On a tool error this is the error result the agent
+   * will receive, and `error` is set too. Handlers may change it in place
+   * (for example to redact secrets) before the agent sees it.
+   */
   result?: unknown;
   error?: string;
   durationMs?: number;
+};
+
+export type PluginHookAfterToolCallOutcome = {
+  /** True when a handler threw. The caller withholds the result (fail closed). */
+  failed: boolean;
 };
 
 // tool_result_persist hook
