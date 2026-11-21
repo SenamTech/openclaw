@@ -101,6 +101,7 @@ export type PluginHookName =
   | "message_sent"
   | "before_tool_call"
   | "after_tool_call"
+  | "tool_result_transform"
   | "tool_result_persist"
   | "before_message_write"
   | "session_start"
@@ -149,6 +150,7 @@ export const PLUGIN_HOOK_NAMES = [
   "message_sent",
   "before_tool_call",
   "after_tool_call",
+  "tool_result_transform",
   "tool_result_persist",
   "before_message_write",
   "session_start",
@@ -681,6 +683,29 @@ export type PluginHookAfterToolCallEvent = {
   durationMs?: number;
 };
 
+/**
+ * tool_result_transform runs after a tool returns, and also when it throws,
+ * with the exact result the agent is about to receive. Unlike after_tool_call
+ * it is awaited before the agent sees the result, so a handler can change what
+ * the model reads (for example to remove secrets). It always fails closed: if a
+ * handler throws or times out, the agent gets a fixed "withheld" error result.
+ */
+export type PluginHookToolResultTransformEvent = {
+  toolName: string;
+  params: Record<string, unknown>;
+  runId?: string;
+  toolCallId?: string;
+  /** The tool result (an AgentToolResult: `content` blocks and optional `details`). */
+  result: unknown;
+  /** Set when the tool threw; `result` is then the error result the agent receives. */
+  error?: string;
+};
+
+export type PluginHookToolResultTransformResult = {
+  /** A replacement result. Omit to keep the result as it is. */
+  result?: unknown;
+};
+
 export type PluginHookToolResultPersistContext = {
   agentId?: string;
   sessionKey?: string;
@@ -1206,6 +1231,13 @@ export type PluginHookHandlerMap = {
     event: PluginHookAfterToolCallEvent,
     ctx: PluginHookToolContext,
   ) => Promise<void> | void;
+  tool_result_transform: (
+    event: PluginHookToolResultTransformEvent,
+    ctx: PluginHookToolContext,
+  ) =>
+    | Promise<PluginHookToolResultTransformResult | void>
+    | PluginHookToolResultTransformResult
+    | void;
   tool_result_persist: (
     event: PluginHookToolResultPersistEvent,
     ctx: PluginHookToolResultPersistContext,

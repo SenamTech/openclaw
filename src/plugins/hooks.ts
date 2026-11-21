@@ -86,6 +86,8 @@ import type {
   PluginHookToolResultPersistContext,
   PluginHookToolResultPersistEvent,
   PluginHookToolResultPersistResult,
+  PluginHookToolResultTransformEvent,
+  PluginHookToolResultTransformResult,
   PluginHookBeforeMessageWriteEvent,
   PluginHookBeforeMessageWriteResult,
   PluginHookBeforeInstallContext,
@@ -142,6 +144,8 @@ export type {
   PluginHookToolResultPersistContext,
   PluginHookToolResultPersistEvent,
   PluginHookToolResultPersistResult,
+  PluginHookToolResultTransformEvent,
+  PluginHookToolResultTransformResult,
   PluginHookBeforeMessageWriteEvent,
   PluginHookBeforeMessageWriteResult,
   PluginHookSessionContext,
@@ -236,7 +240,31 @@ const DEFAULT_MODIFYING_HOOK_TIMEOUT_MS_BY_HOOK: Partial<Record<PluginHookName, 
   before_agent_finalize: 15_000,
   before_prompt_build: 15_000,
   resolve_exec_env: 15_000,
+  // Sits between a tool and the model. A hung handler must not hold the turn;
+  // on timeout the result is withheld (tool_result_transform fails closed).
+  tool_result_transform: 15_000,
 };
+
+/** Text a tool result gets when a result hook failed and the output is withheld. */
+export const TOOL_RESULT_WITHHELD_TEXT =
+  "Tool result withheld: a plugin hook failed while processing it.";
+
+/** Outcome of tool_result_transform: the result to hand to the agent. */
+export type ToolResultTransformOutcome = {
+  result: unknown;
+  /** True when a handler threw or timed out; `result` is then the original. */
+  failed: boolean;
+};
+
+function withheldToolResultMessage(
+  message: PluginHookToolResultPersistEvent["message"],
+): PluginHookToolResultPersistEvent["message"] {
+  const { details: _details, ...rest } = message as typeof message & { details?: unknown };
+  return {
+    ...rest,
+    content: [{ type: "text", text: TOOL_RESULT_WITHHELD_TEXT }],
+  } as PluginHookToolResultPersistEvent["message"];
+}
 
 type ModifyingHookPolicy<K extends PluginHookName, TResult> = {
   mergeResults?: (
@@ -319,6 +347,9 @@ export function createHookRunner(
 
   const shouldCatchHookErrors = (hookName: PluginHookName): boolean =>
     catchErrors && (failurePolicyByHook[hookName] ?? "fail-open") === "fail-open";
+  const persistFailsClosed = (): boolean =>
+    (failurePolicyByHook as Partial<Record<PluginHookName, HookFailurePolicy>>)
+      .tool_result_persist === "fail-closed";
 
   const firstDefined = <T>(prev: T | undefined, next: T | undefined): T | undefined => prev ?? next;
   const lastDefined = <T>(prev: T | undefined, next: T | undefined): T | undefined => next ?? prev;
@@ -1321,6 +1352,43 @@ export function createHookRunner(
   }
 
   /**
+   * Run tool_result_transform hook.
+   *
+   * Awaited between a tool and the agent, on success and on a thrown tool
+   * error. Handlers run sequentially in priority order; each may return
+   * `{ result }` to replace the result passed to the next one. Always fails
+   * closed: when a handler throws or times out, the outcome reports `failed`
+   * and the caller withholds the result.
+   */
+  async function runToolResultTransform(
+    event: PluginHookToolResultTransformEvent,
+    ctx: PluginHookToolContext,
+  ): Promise<ToolResultTransformOutcome> {
+    const hooks = getHooksForName(registry, "tool_result_transform");
+    let current = event.result;
+    for (const hook of hooks) {
+      try {
+        const handler = hook.handler as (
+          event: PluginHookToolResultTransformEvent,
+          ctx: PluginHookToolContext,
+        ) => Promise<PluginHookToolResultTransformResult | void>;
+        const promise = Promise.resolve(handler({ ...event, result: current }, ctx));
+        const timeoutMs = getModifyingHookTimeoutMs("tool_result_transform", hook);
+        const out = timeoutMs ? await withHookTimeout(promise, timeoutMs) : await promise;
+        if (out && out.result !== undefined) {
+          current = out.result;
+        }
+      } catch (err) {
+        logger?.error(
+          `[hooks] tool_result_transform handler from ${hook.pluginId} failed: ${formatHookErrorForLog(err)}; result withheld`,
+        );
+        return { result: event.result, failed: true };
+      }
+    }
+    return { result: current, failed: false };
+  }
+
+  /**
    * Run tool_result_persist hook.
    *
    * This hook is intentionally synchronous: it runs in hot paths where session
@@ -1329,6 +1397,11 @@ export function createHookRunner(
    * Handlers are executed sequentially in priority order (higher first). Each
    * handler may return `{ message }` to replace the message passed to the next
    * handler.
+   *
+   * With the "fail-closed" failure policy, a handler that throws or returns a
+   * Promise cannot be trusted to have processed the message, so its content is
+   * replaced by a fixed notice and its details are dropped (later handlers do
+   * not run). With "fail-open" the failure is logged and the message goes on.
    */
   function runToolResultPersist(
     event: PluginHookToolResultPersistEvent,
@@ -1350,6 +1423,11 @@ export function createHookRunner(
           const msg =
             `[hooks] tool_result_persist handler from ${hook.pluginId} returned a Promise; ` +
             `this hook is synchronous and the result was ignored.`;
+          if (persistFailsClosed()) {
+            logger?.error(`${msg} The tool result content is withheld.`);
+            current = withheldToolResultMessage(current);
+            break;
+          }
           if (shouldCatchHookErrors("tool_result_persist")) {
             logger?.warn?.(msg);
             continue;
@@ -1363,6 +1441,11 @@ export function createHookRunner(
         }
       } catch (err) {
         const msg = `[hooks] tool_result_persist handler from ${hook.pluginId} failed: ${String(err)}`;
+        if (persistFailsClosed()) {
+          logger?.error(`${msg}; the tool result content is withheld`);
+          current = withheldToolResultMessage(current);
+          break;
+        }
         if (shouldCatchHookErrors("tool_result_persist")) {
           logger?.error(msg);
         } else {
@@ -1670,6 +1753,7 @@ export function createHookRunner(
     // Tool hooks
     runBeforeToolCall,
     runAfterToolCall,
+    runToolResultTransform,
     runToolResultPersist,
     // Message write hooks
     runBeforeMessageWrite,

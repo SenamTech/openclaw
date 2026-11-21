@@ -6,6 +6,8 @@
 import { createHash } from "node:crypto";
 import { logDebug, logError } from "../logger.js";
 import { redactToolDetail } from "../logging/redact.js";
+import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
+import { TOOL_RESULT_WITHHELD_TEXT } from "../plugins/hooks.js";
 import { isPlainObject } from "../utils.js";
 import type { HookContext } from "./agent-tools.before-tool-call.js";
 import {
@@ -355,6 +357,55 @@ export function isClientToolNameConflictError(err: unknown): err is Error {
   return err instanceof Error && err.message.startsWith(CLIENT_TOOL_NAME_CONFLICT_PREFIX);
 }
 
+/**
+ * Run tool_result_transform on the result the agent is about to receive (also
+ * for a thrown tool error). Fails closed: a failed handler means the agent gets
+ * a fixed "withheld" error result instead of output it may not have processed.
+ */
+async function applyToolResultTransform(params: {
+  toolName: string;
+  normalizedName: string;
+  toolParams: unknown;
+  toolCallId: string;
+  result: AgentToolResult<unknown>;
+  error?: string;
+  hookContext?: HookContext;
+}): Promise<AgentToolResult<unknown>> {
+  const hookRunner = getGlobalHookRunner();
+  if (!hookRunner?.hasHooks("tool_result_transform")) {
+    return params.result;
+  }
+  try {
+    const outcome = await hookRunner.runToolResultTransform(
+      {
+        toolName: params.toolName,
+        params: isPlainObject(params.toolParams) ? params.toolParams : {},
+        ...(params.hookContext?.runId ? { runId: params.hookContext.runId } : {}),
+        ...(params.toolCallId ? { toolCallId: params.toolCallId } : {}),
+        result: params.result,
+        ...(params.error !== undefined ? { error: params.error } : {}),
+      },
+      {
+        toolName: params.toolName,
+        ...(params.hookContext?.agentId ? { agentId: params.hookContext.agentId } : {}),
+        ...(params.hookContext?.sessionKey ? { sessionKey: params.hookContext.sessionKey } : {}),
+        ...(params.hookContext?.sessionId ? { sessionId: params.hookContext.sessionId } : {}),
+        ...(params.hookContext?.runId ? { runId: params.hookContext.runId } : {}),
+        ...(params.toolCallId ? { toolCallId: params.toolCallId } : {}),
+      },
+    );
+    if (!outcome.failed) {
+      return outcome.result as AgentToolResult<unknown>;
+    }
+  } catch (err) {
+    logDebug(`tool_result_transform failed: tool=${params.normalizedName} error=${String(err)}`);
+  }
+  return buildToolExecutionErrorResult({
+    toolName: params.normalizedName,
+    message: TOOL_RESULT_WITHHELD_TEXT,
+  });
+}
+
 /** Convert executable agent tools into session definitions with hook handling. */
 export function toToolDefinitions(
   tools: AnyAgentTool[],
@@ -429,7 +480,14 @@ export function toToolDefinitions(
             toolName: normalizedName,
             result: rawResult,
           });
-          return result;
+          return await applyToolResultTransform({
+            toolName: name,
+            normalizedName,
+            toolParams: executeParams,
+            toolCallId,
+            result,
+            ...(hookContext ? { hookContext } : {}),
+          });
         } catch (err) {
           if (signal?.aborted) {
             throw err;
@@ -453,9 +511,19 @@ export function toToolDefinitions(
           });
           logError(`[tools] ${normalizedName} failed: ${described.message} ${inputPreview}`);
 
-          return buildToolExecutionErrorResult({
+          // A thrown error goes through tool_result_transform too, with the
+          // error result the agent will receive.
+          return await applyToolResultTransform({
             toolName: normalizedName,
-            message: described.message,
+            normalizedName,
+            toolParams: executeParams,
+            toolCallId,
+            result: buildToolExecutionErrorResult({
+              toolName: normalizedName,
+              message: described.message,
+            }),
+            error: described.message,
+            ...(hookContext ? { hookContext } : {}),
           });
         }
       },

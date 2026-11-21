@@ -2,6 +2,12 @@
 
 Docs: https://docs.openclaw.ai
 
+## Unreleased (SenamTech fork)
+
+### Changes
+
+- **Plugin hooks:** add `tool_result_transform`, awaited before the model sees a tool result (thrown tool errors included), failing closed; `tool_result_persist` withholds content instead of persisting it unchanged when its handler fails under the `fail-closed` policy, which the Gateway now uses for both hooks.
+
 ## 2026.7.1-1
 
 ### Fixes
