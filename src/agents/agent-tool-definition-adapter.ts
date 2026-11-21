@@ -438,6 +438,52 @@ export async function transformNestedToolResult(params: {
   });
 }
 
+/**
+ * Run one nested tool-search target call so that every consumer gets the
+ * transformed result: the tool lifecycle end event, observers, verbose channel
+ * output and the transcript projection. Pass this as the `execute` of the tool
+ * lifecycle. A thrown error is rethrown as a sanitised Error carrying only the
+ * transformed error text (aborts are rethrown as they are).
+ */
+export async function runNestedToolTransformed(params: {
+  toolName: string;
+  toolCallId: string;
+  input: unknown;
+  run: () => Promise<AgentToolResult<unknown>>;
+  signal?: AbortSignal;
+  hookContext?: HookContext;
+}): Promise<AgentToolResult<unknown>> {
+  let raw: AgentToolResult<unknown>;
+  try {
+    raw = await params.run();
+  } catch (err) {
+    const name = err && typeof err === "object" && "name" in err ? String(err.name) : "";
+    if (params.signal?.aborted || name === "AbortError") {
+      throw err;
+    }
+    const transformed = await transformNestedToolResult({
+      toolName: params.toolName,
+      toolCallId: params.toolCallId,
+      input: params.input,
+      errorMessage: describeToolExecutionError(err).message,
+      ...(params.hookContext ? { hookContext: params.hookContext } : {}),
+    });
+    const text = transformed.content
+      .map((block) => (block && typeof block === "object" && "text" in block ? block.text : ""))
+      .join("\n");
+    // No `cause`: the original error holds the raw, unscrubbed text.
+    // oxlint-disable-next-line eslint/preserve-caught-error
+    throw new Error(text || TOOL_RESULT_WITHHELD_TEXT);
+  }
+  return await transformNestedToolResult({
+    toolName: params.toolName,
+    toolCallId: params.toolCallId,
+    input: params.input,
+    result: raw,
+    ...(params.hookContext ? { hookContext: params.hookContext } : {}),
+  });
+}
+
 /** Convert executable agent tools into session definitions with hook handling. */
 export function toToolDefinitions(
   tools: AnyAgentTool[],

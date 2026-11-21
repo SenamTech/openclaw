@@ -115,6 +115,7 @@ import {
   createClientToolNameConflictError,
   findClientToolNameConflicts,
   toClientToolDefinitions,
+  runNestedToolTransformed,
   toToolDefinitions,
   transformNestedToolResult,
 } from "../../agent-tool-definition-adapter.js";
@@ -3827,7 +3828,9 @@ export async function runEmbeddedAttempt(
               params.runId,
             );
           }
-          const rawResult = await runToolLifecycle({
+          // The transform runs inside execute, so the lifecycle end event,
+          // observers and verbose output only ever see the transformed result.
+          const result = await runToolLifecycle({
             toolName: toolParams.toolName,
             toolCallId: toolParams.toolCallId,
             args: toolParams.input,
@@ -3836,20 +3839,21 @@ export async function runEmbeddedAttempt(
               "hideFromChannelProgress" in toolParams.tool &&
               toolParams.tool.hideFromChannelProgress === true,
             execute: async () =>
-              await toolParams.tool.execute(
-                toolParams.toolCallId,
-                toolParams.input,
-                toolParams.signal ?? runAbortController.signal,
-                toolParams.onUpdate,
-                undefined as never,
-              ),
-          });
-          const result = await transformNestedToolResult({
-            toolName: toolParams.toolName,
-            toolCallId: toolParams.toolCallId,
-            input: toolParams.input,
-            result: rawResult,
-            hookContext: catalogToolHookContext,
+              await runNestedToolTransformed({
+                toolName: toolParams.toolName,
+                toolCallId: toolParams.toolCallId,
+                input: toolParams.input,
+                signal: toolParams.signal ?? runAbortController.signal,
+                hookContext: catalogToolHookContext,
+                run: async () =>
+                  await toolParams.tool.execute(
+                    toolParams.toolCallId,
+                    toolParams.input,
+                    toolParams.signal ?? runAbortController.signal,
+                    toolParams.onUpdate,
+                    undefined as never,
+                  ),
+              }),
           });
           toolSearchTargetTranscriptProjections.push({
             parentToolCallId: toolParams.parentToolCallId,
