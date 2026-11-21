@@ -5,10 +5,12 @@
  * error handling, priority ordering, and async support.
  */
 
+import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { PluginRegistry } from "./registry.js";
 import type {
   PluginHookAfterCompactionEvent,
   PluginHookAfterToolCallEvent,
+  PluginHookAfterToolCallOutcome,
   PluginHookAgentContext,
   PluginHookAgentEndEvent,
   PluginHookBeforeAgentStartEvent,
@@ -91,6 +93,15 @@ function getHooksForName<K extends PluginHookName>(
   return (registry.typedHooks as PluginHookRegistration<K>[])
     .filter((h) => h.hookName === hookName)
     .toSorted((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
+}
+
+/** Text a tool result gets when a result hook failed and the output is withheld. */
+export const TOOL_RESULT_WITHHELD_TEXT =
+  "Tool result withheld: a plugin hook failed while processing it.";
+
+function withheldToolResultMessage(message: AgentMessage): AgentMessage {
+  const { details: _details, ...rest } = message as AgentMessage & { details?: unknown };
+  return { ...rest, content: [{ type: "text", text: TOOL_RESULT_WITHHELD_TEXT }] } as AgentMessage;
 }
 
 /**
@@ -349,6 +360,38 @@ export function createHookRunner(registry: PluginRegistry, options: HookRunnerOp
   }
 
   /**
+   * Run after_tool_call hook.
+   *
+   * Handlers run in parallel, like other void hooks, and may change the result
+   * object in place. When a handler throws, the outcome reports `failed` so the
+   * caller can withhold the result instead of passing on output that a handler
+   * may not have finished changing (fail closed).
+   */
+  async function runAfterToolCallWithOutcome(
+    event: PluginHookAfterToolCallEvent,
+    ctx: PluginHookToolContext,
+  ): Promise<PluginHookAfterToolCallOutcome> {
+    const hooks = getHooksForName(registry, "after_tool_call");
+    let failed = false;
+    await Promise.all(
+      hooks.map(async (hook) => {
+        try {
+          await hook.handler(event, ctx);
+        } catch (err) {
+          failed = true;
+          const msg = `[hooks] after_tool_call handler from ${hook.pluginId} failed: ${String(err)}`;
+          if (catchErrors) {
+            logger?.error(msg);
+          } else {
+            throw new Error(msg, { cause: err });
+          }
+        }
+      }),
+    );
+    return { failed };
+  }
+
+  /**
    * Run tool_result_persist hook.
    *
    * This hook is intentionally synchronous: it runs in hot paths where session
@@ -357,6 +400,10 @@ export function createHookRunner(registry: PluginRegistry, options: HookRunnerOp
    * Handlers are executed sequentially in priority order (higher first). Each
    * handler may return `{ message }` to replace the message passed to the next
    * handler.
+   *
+   * Fail closed: when a handler throws (or returns a Promise), its change cannot
+   * be trusted, so the message's content is replaced by a fixed notice and its
+   * details are dropped instead of persisting the unchanged message.
    */
   function runToolResultPersist(
     event: PluginHookToolResultPersistEvent,
@@ -385,7 +432,8 @@ export function createHookRunner(registry: PluginRegistry, options: HookRunnerOp
             `this hook is synchronous and the result was ignored.`;
           if (catchErrors) {
             logger?.warn?.(msg);
-            continue;
+            current = withheldToolResultMessage(current);
+            break;
           }
           throw new Error(msg);
         }
@@ -398,6 +446,8 @@ export function createHookRunner(registry: PluginRegistry, options: HookRunnerOp
         const msg = `[hooks] tool_result_persist handler from ${hook.pluginId} failed: ${String(err)}`;
         if (catchErrors) {
           logger?.error(msg);
+          current = withheldToolResultMessage(current);
+          break;
         } else {
           throw new Error(msg, { cause: err });
         }
@@ -493,6 +543,7 @@ export function createHookRunner(registry: PluginRegistry, options: HookRunnerOp
     // Tool hooks
     runBeforeToolCall,
     runAfterToolCall,
+    runAfterToolCallWithOutcome,
     runToolResultPersist,
     // Session hooks
     runSessionStart,
