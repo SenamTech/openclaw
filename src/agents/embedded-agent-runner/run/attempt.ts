@@ -115,7 +115,9 @@ import {
   createClientToolNameConflictError,
   findClientToolNameConflicts,
   toClientToolDefinitions,
+  runNestedToolTransformed,
   toToolDefinitions,
+  transformNestedToolResult,
 } from "../../agent-tool-definition-adapter.js";
 import { recordStructuredReplayTrustForToolCall } from "../../agent-tools.before-tool-call.js";
 import {
@@ -3826,6 +3828,8 @@ export async function runEmbeddedAttempt(
               params.runId,
             );
           }
+          // The transform runs inside execute, so the lifecycle end event,
+          // observers and verbose output only ever see the transformed result.
           const result = await runToolLifecycle({
             toolName: toolParams.toolName,
             toolCallId: toolParams.toolCallId,
@@ -3835,13 +3839,21 @@ export async function runEmbeddedAttempt(
               "hideFromChannelProgress" in toolParams.tool &&
               toolParams.tool.hideFromChannelProgress === true,
             execute: async () =>
-              await toolParams.tool.execute(
-                toolParams.toolCallId,
-                toolParams.input,
-                toolParams.signal ?? runAbortController.signal,
-                toolParams.onUpdate,
-                undefined as never,
-              ),
+              await runNestedToolTransformed({
+                toolName: toolParams.toolName,
+                toolCallId: toolParams.toolCallId,
+                input: toolParams.input,
+                signal: toolParams.signal ?? runAbortController.signal,
+                hookContext: catalogToolHookContext,
+                run: async () =>
+                  await toolParams.tool.execute(
+                    toolParams.toolCallId,
+                    toolParams.input,
+                    toolParams.signal ?? runAbortController.signal,
+                    toolParams.onUpdate,
+                    undefined as never,
+                  ),
+              }),
           });
           toolSearchTargetTranscriptProjections.push({
             parentToolCallId: toolParams.parentToolCallId,
@@ -3859,10 +3871,13 @@ export async function runEmbeddedAttempt(
             toolCallId: toolParams.toolCallId,
             toolName: toolParams.toolName,
             input: toolParams.input,
-            result: {
-              content: [{ type: "text", text: message }],
-              details: { status: "error", error: message },
-            },
+            result: await transformNestedToolResult({
+              toolName: toolParams.toolName,
+              toolCallId: toolParams.toolCallId,
+              input: toolParams.input,
+              errorMessage: message,
+              hookContext: catalogToolHookContext,
+            }),
             isError: true,
             timestamp: Date.now(),
           });

@@ -6,6 +6,8 @@
 import { createHash } from "node:crypto";
 import { logDebug, logError } from "../logger.js";
 import { redactToolDetail } from "../logging/redact.js";
+import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
+import { TOOL_RESULT_WITHHELD_TEXT } from "../plugins/hooks.js";
 import { isPlainObject } from "../utils.js";
 import type { HookContext } from "./agent-tools.before-tool-call.js";
 import {
@@ -355,6 +357,133 @@ export function isClientToolNameConflictError(err: unknown): err is Error {
   return err instanceof Error && err.message.startsWith(CLIENT_TOOL_NAME_CONFLICT_PREFIX);
 }
 
+/**
+ * Run tool_result_transform on the result the agent is about to receive (also
+ * for a thrown tool error). Fails closed: a failed handler means the agent gets
+ * a fixed "withheld" error result instead of output it may not have processed.
+ */
+async function applyToolResultTransform(params: {
+  toolName: string;
+  normalizedName: string;
+  toolParams: unknown;
+  toolCallId: string;
+  result: AgentToolResult<unknown>;
+  error?: string;
+  hookContext?: HookContext;
+}): Promise<AgentToolResult<unknown>> {
+  const hookRunner = getGlobalHookRunner();
+  if (!hookRunner?.hasHooks("tool_result_transform")) {
+    return params.result;
+  }
+  try {
+    const outcome = await hookRunner.runToolResultTransform(
+      {
+        toolName: params.toolName,
+        params: isPlainObject(params.toolParams) ? params.toolParams : {},
+        ...(params.hookContext?.runId ? { runId: params.hookContext.runId } : {}),
+        ...(params.toolCallId ? { toolCallId: params.toolCallId } : {}),
+        result: params.result,
+        ...(params.error !== undefined ? { error: params.error } : {}),
+      },
+      {
+        toolName: params.toolName,
+        ...(params.hookContext?.agentId ? { agentId: params.hookContext.agentId } : {}),
+        ...(params.hookContext?.sessionKey ? { sessionKey: params.hookContext.sessionKey } : {}),
+        ...(params.hookContext?.sessionId ? { sessionId: params.hookContext.sessionId } : {}),
+        ...(params.hookContext?.runId ? { runId: params.hookContext.runId } : {}),
+        ...(params.toolCallId ? { toolCallId: params.toolCallId } : {}),
+      },
+    );
+    if (!outcome.failed) {
+      return outcome.result as AgentToolResult<unknown>;
+    }
+  } catch (err) {
+    logDebug(`tool_result_transform failed: tool=${params.normalizedName} error=${String(err)}`);
+  }
+  return buildToolExecutionErrorResult({
+    toolName: params.normalizedName,
+    message: TOOL_RESULT_WITHHELD_TEXT,
+  });
+}
+
+/**
+ * tool-search runs its nested target tools directly, outside toToolDefinitions,
+ * and projects their results into the transcript. Give such a result (or the
+ * error a nested call threw) the same tool_result_transform pass, failing
+ * closed, before it is projected or returned.
+ */
+export async function transformNestedToolResult(params: {
+  toolName: string;
+  toolCallId: string;
+  input: unknown;
+  result?: AgentToolResult<unknown>;
+  errorMessage?: string;
+  hookContext?: HookContext;
+}): Promise<AgentToolResult<unknown>> {
+  const result =
+    params.errorMessage !== undefined
+      ? {
+          content: [{ type: "text" as const, text: params.errorMessage }],
+          details: { status: "error", error: params.errorMessage },
+        }
+      : (params.result as AgentToolResult<unknown>);
+  return await applyToolResultTransform({
+    toolName: params.toolName,
+    normalizedName: normalizeToolName(params.toolName),
+    toolParams: params.input,
+    toolCallId: params.toolCallId,
+    result,
+    ...(params.errorMessage !== undefined ? { error: params.errorMessage } : {}),
+    ...(params.hookContext ? { hookContext: params.hookContext } : {}),
+  });
+}
+
+/**
+ * Run one nested tool-search target call so that every consumer gets the
+ * transformed result: the tool lifecycle end event, observers, verbose channel
+ * output and the transcript projection. Pass this as the `execute` of the tool
+ * lifecycle. A thrown error is rethrown as a sanitised Error carrying only the
+ * transformed error text (aborts are rethrown as they are).
+ */
+export async function runNestedToolTransformed(params: {
+  toolName: string;
+  toolCallId: string;
+  input: unknown;
+  run: () => Promise<AgentToolResult<unknown>>;
+  signal?: AbortSignal;
+  hookContext?: HookContext;
+}): Promise<AgentToolResult<unknown>> {
+  let raw: AgentToolResult<unknown>;
+  try {
+    raw = await params.run();
+  } catch (err) {
+    const name = err && typeof err === "object" && "name" in err ? String(err.name) : "";
+    if (params.signal?.aborted || name === "AbortError") {
+      throw err;
+    }
+    const transformed = await transformNestedToolResult({
+      toolName: params.toolName,
+      toolCallId: params.toolCallId,
+      input: params.input,
+      errorMessage: describeToolExecutionError(err).message,
+      ...(params.hookContext ? { hookContext: params.hookContext } : {}),
+    });
+    const text = transformed.content
+      .map((block) => (block && typeof block === "object" && "text" in block ? block.text : ""))
+      .join("\n");
+    // No `cause`: the original error holds the raw, unscrubbed text.
+    // oxlint-disable-next-line eslint/preserve-caught-error
+    throw new Error(text || TOOL_RESULT_WITHHELD_TEXT);
+  }
+  return await transformNestedToolResult({
+    toolName: params.toolName,
+    toolCallId: params.toolCallId,
+    input: params.input,
+    result: raw,
+    ...(params.hookContext ? { hookContext: params.hookContext } : {}),
+  });
+}
+
 /** Convert executable agent tools into session definitions with hook handling. */
 export function toToolDefinitions(
   tools: AnyAgentTool[],
@@ -429,7 +558,14 @@ export function toToolDefinitions(
             toolName: normalizedName,
             result: rawResult,
           });
-          return result;
+          return await applyToolResultTransform({
+            toolName: name,
+            normalizedName,
+            toolParams: executeParams,
+            toolCallId,
+            result,
+            ...(hookContext ? { hookContext } : {}),
+          });
         } catch (err) {
           if (signal?.aborted) {
             throw err;
@@ -453,9 +589,19 @@ export function toToolDefinitions(
           });
           logError(`[tools] ${normalizedName} failed: ${described.message} ${inputPreview}`);
 
-          return buildToolExecutionErrorResult({
+          // A thrown error goes through tool_result_transform too, with the
+          // error result the agent will receive.
+          return await applyToolResultTransform({
             toolName: normalizedName,
-            message: described.message,
+            normalizedName,
+            toolParams: executeParams,
+            toolCallId,
+            result: buildToolExecutionErrorResult({
+              toolName: normalizedName,
+              message: described.message,
+            }),
+            error: described.message,
+            ...(hookContext ? { hookContext } : {}),
           });
         }
       },

@@ -47,6 +47,8 @@ export function initializeGlobalHookRunner(registry: GlobalHookRunnerRegistry): 
         before_agent_run: "fail-closed",
         before_install: "fail-closed",
         before_tool_call: "fail-closed",
+        tool_result_transform: "fail-closed",
+        tool_result_persist: "fail-closed",
       },
     });
   }

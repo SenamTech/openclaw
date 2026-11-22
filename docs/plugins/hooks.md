@@ -118,13 +118,14 @@ observation-only.
 
 **Tools**
 
-| Hook                       | Purpose                                                   |
-| -------------------------- | --------------------------------------------------------- |
-| **`before_tool_call`**     | Rewrite tool params, block execution, or require approval |
-| `after_tool_call`          | Observe tool results, errors, and duration                |
-| `resolve_exec_env`         | Contribute plugin-owned environment variables to `exec`   |
-| **`tool_result_persist`**  | Rewrite the assistant message produced from a tool result |
-| **`before_message_write`** | Inspect or block an in-progress message write (rare)      |
+| Hook                        | Purpose                                                                     |
+| --------------------------- | --------------------------------------------------------------------------- |
+| **`before_tool_call`**      | Rewrite tool params, block execution, or require approval                   |
+| `after_tool_call`           | Observe tool results, errors, and duration                                  |
+| **`tool_result_transform`** | Change a tool result (or tool error) before the model sees it; fails closed |
+| `resolve_exec_env`          | Contribute plugin-owned environment variables to `exec`                     |
+| **`tool_result_persist`**   | Rewrite the assistant message produced from a tool result                   |
+| **`before_message_write`**  | Inspect or block an in-progress message write (rare)                        |
 
 **Messages and delivery**
 
@@ -304,6 +305,13 @@ not prompt content:
   input so metadata does not become model context.
 - Persisted session entries keep only bounded `details`. Oversized details are
   replaced with a compact summary and `persistedDetailsTruncated: true`.
+- `tool_result_transform` is awaited between the tool and the model, also
+  when the tool throws (`event.error` is set and `event.result` is the error
+  result). Return `{ result }` to replace it. If a handler throws or times out,
+  the model gets a fixed "tool result withheld" error instead of the output.
+- With the `fail-closed` policy (the Gateway default), a `tool_result_persist`
+  handler that throws or returns a Promise withholds the persisted content
+  instead of saving the unchanged message.
 - `tool_result_persist` and `before_message_write` run before the final
   persistence cap. Keep returned `details` small and avoid placing
   prompt-relevant text only in `details`; put model-visible tool output in
